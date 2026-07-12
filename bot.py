@@ -76,9 +76,24 @@ def take_screenshot(d):
             pil_img = d.screenshot()
             return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
-def find_template_on_screen(screen_bgr, template_path, threshold=config.TEMPLATE_THRESHOLD):
+def get_sobel_edges(img):
+    """
+    Вычисляет градиенты Собеля по направлениям X и Y, объединяет их
+    для получения контуров изображения (помогает игнорировать градиенты фона).
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    sobelx = cv2.Sobel(blurred, cv2.CV_8U, 1, 0, ksize=3)
+    sobely = cv2.Sobel(blurred, cv2.CV_8U, 0, 1, ksize=3)
+    return cv2.addWeighted(sobelx, 0.5, sobely, 0.5, 0)
+
+def find_template_on_screen(screen_bgr, template_path, threshold=config.TEMPLATE_THRESHOLD, method="bgr"):
     """
     Ищет изображение-шаблон на скриншоте экрана.
+    Поддерживает методы:
+      - "bgr": сопоставление по исходным цветам BGR
+      - "hsv": сопоставление по цветовому пространству HSV (3 канала)
+      - "sobel": сопоставление по контурам Собеля (устойчиво к градиентным фонам)
     Возвращает (x, y) центра совпадения и коэффициент уверенности, или (None, 0.0).
     """
     if not os.path.exists(template_path):
@@ -91,8 +106,20 @@ def find_template_on_screen(screen_bgr, template_path, threshold=config.TEMPLATE
     # Размеры шаблона
     h_t, w_t = template_img.shape[:2]
     
+    # Предобработка скриншота и шаблона в зависимости от метода
+    method_lower = method.lower()
+    if method_lower == "sobel":
+        s_processed = get_sobel_edges(screen_bgr)
+        t_processed = get_sobel_edges(template_img)
+    elif method_lower == "hsv":
+        s_processed = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2HSV)
+        t_processed = cv2.cvtColor(template_img, cv2.COLOR_BGR2HSV)
+    else:
+        s_processed = screen_bgr
+        t_processed = template_img
+
     # Шаблонный поиск
-    res = cv2.matchTemplate(screen_bgr, template_img, cv2.TM_CCOEFF_NORMED)
+    res = cv2.matchTemplate(s_processed, t_processed, cv2.TM_CCOEFF_NORMED)
     min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
     
     if max_val >= threshold:
@@ -101,6 +128,7 @@ def find_template_on_screen(screen_bgr, template_path, threshold=config.TEMPLATE
         return (cx, cy), max_val
         
     return None, max_val
+
 
 def check_for_navigation_buttons(d, screen_bgr):
     """
@@ -124,13 +152,13 @@ def check_for_navigation_buttons(d, screen_bgr):
     
     # Сначала проверяем кнопку Next (приоритет — переход на уровень)
     for t_path in next_templates:
-        pos, score = find_template_on_screen(screen_bgr, t_path)
+        pos, score = find_template_on_screen(screen_bgr, t_path, method=config.NAV_BUTTONS_MATCH_METHOD)
         if pos:
             return pos, os.path.basename(t_path), "next_level"
     
     # Затем промежуточные continue
     for t_path in continue_templates:
-        pos, score = find_template_on_screen(screen_bgr, t_path)
+        pos, score = find_template_on_screen(screen_bgr, t_path, method=config.NAV_BUTTONS_MATCH_METHOD)
         if pos:
             return pos, os.path.basename(t_path), "tap_continue"
             
@@ -180,7 +208,7 @@ def watchdog_worker(d, stop_event):
                         x_templates.append(os.path.join(config.TEMPLATES_DIR, f))
             
             for t_path in x_templates:
-                pos, score = find_template_on_screen(screen_bgr, t_path)
+                pos, score = find_template_on_screen(screen_bgr, t_path, method=config.AD_CLOSE_MATCH_METHOD)
                 if pos:
                     print(f"[Watchdog] Обнаружен рекламный крестик ({os.path.basename(t_path)}) с уверенностью {score:.2f}. Закрываем рекламу по координатам {pos}...")
                     with device_lock:
@@ -644,7 +672,7 @@ def main():
             solutions = []
             expected_letters = None
             
-            if current_level is not None:
+            if current_level is not None and stuck_counter < config.STUCK_LOCAL_FALLBACK_LIMIT:
                 if mismatch_counter < 2:
                     print(f"[*] Скачивание ответов для Уровня {current_level} с сайта wordcityanswers.com...")
                     solutions = utils.get_words_for_level(current_level)
@@ -690,7 +718,11 @@ def main():
                 continue
                 
             # Шаг C. Генерация/сопоставление решений
-            if not solutions:
+            if stuck_counter >= config.STUCK_LOCAL_FALLBACK_LIMIT:
+                print(f"[!] Уровень не пройден за {stuck_counter} попыток подряд. Используем локальный словарь...")
+                solutions = utils.solve_anagrams(detected_chars, dictionary)
+                print(f"[+] Сгенерировано {len(solutions)} возможных слов из локального словаря.")
+            elif not solutions:
                 # Если уровень не был известен или скачивание напрямую не удалось,
                 # ищем ответы по буквам на сайте
                 print("[*] Поиск решений по буквам на сайте wordcityanswers.com...")
@@ -787,8 +819,8 @@ def main():
                     time.sleep(config.ACTION_DELAY)
                     continue
                 
-                # Если застряли 3+ раза подряд — принудительный сброс
-                if stuck_counter >= 3:
+                # Если застряли STUCK_RESET_LIMIT+ раза подряд — принудительный сброс
+                if stuck_counter >= config.STUCK_RESET_LIMIT:
                     print(f"[!] Бот застрял ({stuck_counter} попыток подряд без прогресса).")
                     print(f"[!] Сбрасываем номер уровня и переходим на полное распознавание OCR.")
                     current_level = None
