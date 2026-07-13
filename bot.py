@@ -7,6 +7,7 @@
 import os
 import sys
 import time
+import json
 import threading
 import cv2
 import numpy as np
@@ -18,6 +19,10 @@ import utils
 # Глобальный замок для синхронизации доступа к устройству между основным потоком и watchdog
 device_lock = threading.Lock()
 stop_event = threading.Event()
+
+# Timestamp, до которого основной цикл НЕ запускает OCR (после обнаружения рекламы)
+ad_cooldown_until = 0.0
+ad_cooldown_lock = threading.Lock()
 
 try:
     import msvcrt
@@ -87,13 +92,16 @@ def get_sobel_edges(img):
     sobely = cv2.Sobel(blurred, cv2.CV_8U, 0, 1, ksize=3)
     return cv2.addWeighted(sobelx, 0.5, sobely, 0.5, 0)
 
-def find_template_on_screen(screen_bgr, template_path, threshold=config.TEMPLATE_THRESHOLD, method="bgr"):
+def find_template_on_screen(screen_bgr, template_path, threshold=config.TEMPLATE_THRESHOLD,
+                            method="bgr", search_region=None):
     """
     Ищет изображение-шаблон на скриншоте экрана.
     Поддерживает методы:
       - "bgr": сопоставление по исходным цветам BGR
       - "hsv": сопоставление по цветовому пространству HSV (3 канала)
       - "sobel": сопоставление по контурам Собеля (устойчиво к градиентным фонам)
+
+    search_region: (y_start, y_end) — ограничить поиск по вертикали (опционально).
     Возвращает (x, y) центра совпадения и коэффициент уверенности, или (None, 0.0).
     """
     if not os.path.exists(template_path):
@@ -102,20 +110,33 @@ def find_template_on_screen(screen_bgr, template_path, threshold=config.TEMPLATE
     template_img = cv2.imread(template_path)
     if template_img is None:
         return None, 0.0
+
+    # Ограничиваем область поиска, если задано
+    if search_region:
+        y_start, y_end = search_region
+        search_area = screen_bgr[y_start:y_end, :]
+        y_offset = y_start
+    else:
+        search_area = screen_bgr
+        y_offset = 0
         
     # Размеры шаблона
     h_t, w_t = template_img.shape[:2]
+
+    # Проверяем что область поиска достаточна для шаблона
+    if search_area.shape[0] < h_t or search_area.shape[1] < w_t:
+        return None, 0.0
     
     # Предобработка скриншота и шаблона в зависимости от метода
     method_lower = method.lower()
     if method_lower == "sobel":
-        s_processed = get_sobel_edges(screen_bgr)
+        s_processed = get_sobel_edges(search_area)
         t_processed = get_sobel_edges(template_img)
     elif method_lower == "hsv":
-        s_processed = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2HSV)
+        s_processed = cv2.cvtColor(search_area, cv2.COLOR_BGR2HSV)
         t_processed = cv2.cvtColor(template_img, cv2.COLOR_BGR2HSV)
     else:
-        s_processed = screen_bgr
+        s_processed = search_area
         t_processed = template_img
 
     # Шаблонный поиск
@@ -124,7 +145,7 @@ def find_template_on_screen(screen_bgr, template_path, threshold=config.TEMPLATE
     
     if max_val >= threshold:
         cx = max_loc[0] + w_t // 2
-        cy = max_loc[1] + h_t // 2
+        cy = max_loc[1] + h_t // 2 + y_offset  # Добавляем смещение по Y
         return (cx, cy), max_val
         
     return None, max_val
@@ -164,14 +185,37 @@ def check_for_navigation_buttons(d, screen_bgr):
             
     return None, None, None
 
+
+def _set_ad_cooldown():
+    """Выставляет cooldown для основного цикла после обнаружения рекламы."""
+    global ad_cooldown_until
+    with ad_cooldown_lock:
+        ad_cooldown_until = time.time() + config.AD_COOLDOWN_SECONDS
+
+
+def _is_ad_cooldown_active() -> bool:
+    """Проверяет, активен ли cooldown после рекламы."""
+    with ad_cooldown_lock:
+        return time.time() < ad_cooldown_until
+
+
 def watchdog_worker(d, stop_event):
     """
     Фоновый поток (Watchdog).
     Быстро проверяет:
     1. Не сменилось ли приложение на Google Play / браузер (если да, шлет "back").
     2. Нет ли на экране рекламных крестиков [X] (если да, кликает по ним).
+
+    Улучшения:
+    - Ограничение зоны поиска шаблонов (верхние 25% экрана)
+    - Cooldown по шаблонам: не кликать один шаблон более N раз за M секунд
+    - Выставление ad_cooldown для основного цикла
     """
     print("[*] Поток Watchdog запущен.")
+
+    # Словарь для отслеживания кликов по каждому шаблону: {template_name: [timestamp, ...]}
+    template_click_history = {}
+
     while not stop_event.is_set():
         try:
             # 1. Проверяем текущее активное приложение (дешёвая операция — делаем первой)
@@ -193,11 +237,17 @@ def watchdog_worker(d, stop_event):
                     print(f"[Watchdog] Нежелательное приложение в фокусе: {package_name}. Отправляем кнопку BACK...")
                     with device_lock:
                         d.press("back")
+                    _set_ad_cooldown()
                     time.sleep(1.0)
                     continue
 
             # 2. Сканируем экран на наличие рекламных крестиков (дорогая операция — делаем после проверки пакета)
             screen_bgr = take_screenshot(d)
+            screen_h = screen_bgr.shape[0]
+
+            # Ограничиваем область поиска верхней частью экрана
+            ad_search_y_end = int(screen_h * config.AD_SEARCH_REGION_RATIO)
+            search_region = (0, ad_search_y_end)
             
             # Собираем шаблоны рекламных крестиков
             x_templates = []
@@ -208,11 +258,36 @@ def watchdog_worker(d, stop_event):
                         x_templates.append(os.path.join(config.TEMPLATES_DIR, f))
             
             for t_path in x_templates:
-                pos, score = find_template_on_screen(screen_bgr, t_path, method=config.AD_CLOSE_MATCH_METHOD)
+                t_name = os.path.basename(t_path)
+
+                # Проверяем cooldown по шаблону: не кликали ли мы его слишком часто
+                now = time.time()
+                if t_name in template_click_history:
+                    # Удаляем устаревшие записи
+                    template_click_history[t_name] = [
+                        ts for ts in template_click_history[t_name]
+                        if now - ts < config.AD_TEMPLATE_CLICK_WINDOW
+                    ]
+                    if len(template_click_history[t_name]) >= config.AD_TEMPLATE_CLICK_LIMIT:
+                        # Слишком много кликов по этому шаблону — пропускаем
+                        continue
+
+                pos, score = find_template_on_screen(
+                    screen_bgr, t_path,
+                    method=config.AD_CLOSE_MATCH_METHOD,
+                    search_region=search_region
+                )
                 if pos:
-                    print(f"[Watchdog] Обнаружен рекламный крестик ({os.path.basename(t_path)}) с уверенностью {score:.2f}. Закрываем рекламу по координатам {pos}...")
+                    print(f"[Watchdog] Обнаружен рекламный крестик ({t_name}) с уверенностью {score:.2f}. Закрываем рекламу по координатам {pos}...")
                     with device_lock:
                         d.click(pos[0], pos[1])
+
+                    # Записываем клик в историю
+                    if t_name not in template_click_history:
+                        template_click_history[t_name] = []
+                    template_click_history[t_name].append(now)
+
+                    _set_ad_cooldown()
                     time.sleep(1.0)
                     break  # Переходим к следующему циклу watchdog
                     
@@ -547,16 +622,26 @@ def check_game_state(d, screen_bgr=None):
 
 def _is_game_in_foreground(d):
     """
-    Проверяет, что игра сейчас в фокусе (а не Play Market/браузер).
+    Проверяет, что игра сейчас в фокусе.
+    Использует GAME_PACKAGE для точной проверки + проверку подозрительных пакетов.
     """
     try:
         with device_lock:
             app = d.app_current()
         package_name = app.get("package") if app else None
-        if package_name:
-            for susp in config.SUSPICIOUS_PACKAGES:
-                if susp in package_name:
-                    return False
+        if not package_name:
+            return True  # Не удалось определить — не блокируем
+
+        # Проверяем, что это именно игра
+        if config.GAME_PACKAGE and config.GAME_PACKAGE in package_name:
+            return True
+
+        # Проверяем, не подозрительный ли пакет
+        for susp in config.SUSPICIOUS_PACKAGES:
+            if susp in package_name:
+                return False
+
+        # Неизвестный пакет — может быть оверлей рекламы, не блокируем
         return True
     except Exception:
         return True
@@ -578,6 +663,47 @@ def _wait_for_button_gone(d, timeout=4.0):
     print("[*] Таймаут ожидания. Продолжаем.")
 
 
+def _enable_show_taps(d, enable=True):
+    """
+    Включает/выключает отображение нажатий на экране через Developer Options.
+    Полезно для отладки — видно где именно бот нажимает.
+    """
+    value = 1 if enable else 0
+    try:
+        with device_lock:
+            d.shell(f"settings put system show_touches {value}")
+        state_str = "включено" if enable else "выключено"
+        print(f"[+] Отображение нажатий на экране {state_str}.")
+    except Exception as e:
+        print(f"[!] Не удалось {'включить' if enable else 'выключить'} show_touches: {e}")
+
+
+def _save_level_state(current_level):
+    """Сохраняет текущий уровень в файл для восстановления при перезапуске."""
+    try:
+        state = {"current_level": current_level, "timestamp": time.time()}
+        with open(config.LEVEL_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f"[!] Ошибка сохранения состояния уровня: {e}")
+
+
+def _load_level_state():
+    """Загружает сохранённый уровень из файла. Возвращает номер уровня или None."""
+    try:
+        if os.path.exists(config.LEVEL_STATE_FILE):
+            with open(config.LEVEL_STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            level = state.get("current_level")
+            ts = state.get("timestamp", 0)
+            # Считаем состояние актуальным в течение 24 часов
+            if level is not None and (time.time() - ts) < 86400:
+                return level
+    except Exception as e:
+        print(f"[!] Ошибка загрузки состояния уровня: {e}")
+    return None
+
+
 def main():
     print("====================================================")
     print("   Запуск автокликера Word City: Connect Word Game   ")
@@ -585,6 +711,10 @@ def main():
     
     # 1. Подключение устройства
     d = connect_device()
+
+    # 1.1. Включаем отображение нажатий для отладки
+    if config.SHOW_TAPS:
+        _enable_show_taps(d, enable=True)
     
     # 2. Загрузка словаря
     dictionary = utils.load_dictionary()
@@ -612,6 +742,10 @@ def main():
         
     reader = easyocr.Reader(config.OCR_LANGUAGES, gpu=use_gpu)
     print("[+] EasyOCR успешно инициализирован.")
+
+    # 3.1. Инициализация AI Self-Healing сервиса
+    from ai_healing import AIHealingService
+    ai_service = AIHealingService()
     
     # 4. Запуск Watchdog потока
     stop_event.clear()
@@ -622,14 +756,28 @@ def main():
     print("    Нажмите Ctrl+C в терминале для остановки бота.")
     print("    Нажмите ПРОБЕЛ или 'P' в окне консоли для приостановки бота (пауза).")
     
+    # Загрузка сохранённого уровня
+    saved_level = _load_level_state()
+
     # Запрос стартового уровня у пользователя
     try:
-        level_input = input("\n[*] Введите номер текущего уровня (или нажмите Enter для автоопределения по буквам): ").strip()
-        current_level = int(level_input) if level_input.isdigit() else None
+        if saved_level is not None:
+            level_input = input(f"\n[*] Найден сохранённый уровень: {saved_level}. Нажмите Enter для продолжения или введите другой номер: ").strip()
+        else:
+            level_input = input("\n[*] Введите номер текущего уровня (или нажмите Enter для автоопределения по буквам): ").strip()
+        
+        if level_input.isdigit():
+            current_level = int(level_input)
+        elif saved_level is not None and not level_input:
+            current_level = saved_level
+            print(f"[+] Продолжаем с сохранённого уровня: {current_level}")
+        else:
+            current_level = None
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception:
-        current_level = None
+        current_level = saved_level
+
     mismatch_counter = 0
     stuck_counter = 0  # Счётчик: сколько раз подряд уровень не прошёл после ввода всех слов
     try:
@@ -641,6 +789,14 @@ def main():
             if not _is_game_in_foreground(d):
                 print("[Watchdog] Мы не в игре, ждём возврата...")
                 time.sleep(1.5)
+                continue
+
+            # Шаг A0.5. Проверяем cooldown после рекламы
+            if _is_ad_cooldown_active():
+                remaining = ad_cooldown_until - time.time()
+                if remaining > 0.5:  # Логируем только если ожидание значительное
+                    print(f"[*] Ожидание закрытия рекламы ({remaining:.1f}с)...")
+                time.sleep(0.5)
                 continue
             
             # Шаг A. Получаем скриншот один раз для всего цикла
@@ -664,6 +820,7 @@ def main():
                 if current_level is not None:
                     current_level += 1
                     print(f"[+] Переход на следующий уровень. Ожидаемый уровень: {current_level}")
+                    _save_level_state(current_level)
                 stuck_counter = 0
                 _wait_for_button_gone(d)
                 continue
@@ -671,8 +828,14 @@ def main():
             # Шаг B. Получение решений и распознавание букв
             solutions = []
             expected_letters = None
-            
-            if current_level is not None and stuck_counter < config.STUCK_LOCAL_FALLBACK_LIMIT:
+
+            # Определяем стратегию в зависимости от stuck_counter
+            use_ai_healing = False
+
+            if stuck_counter >= config.STUCK_AI_HEALING_LIMIT:
+                # Все стратегии исчерпаны — вызываем AI
+                use_ai_healing = True
+            elif current_level is not None and stuck_counter < config.STUCK_LOCAL_FALLBACK_LIMIT:
                 if mismatch_counter < 2:
                     print(f"[*] Скачивание ответов для Уровня {current_level} с сайта wordcityanswers.com...")
                     solutions = utils.get_words_for_level(current_level)
@@ -686,6 +849,121 @@ def main():
                     current_level = None
                     mismatch_counter = 0
             
+            # AI Self-Healing: альтернативное распознавание букв
+            if use_ai_healing and ai_service.is_enabled:
+                print(f"\n[AI Healing] === Активация AI Self-Healing (stuck={stuck_counter}) ===")
+
+                # Шаг 1: AI распознаёт буквы
+                ai_letters = ai_service.recognize_letters(screen_bgr)
+                if ai_letters:
+                    print(f"[AI Healing] AI распознал буквы: {ai_letters}")
+
+                    # Шаг 2: AI генерирует слова
+                    ai_words = ai_service.solve_with_ai(ai_letters)
+                    if ai_words:
+                        solutions = ai_words
+                        # Пересканируем буквы с OCR для получения координат
+                        # (AI дал буквы, но нам нужны позиции для свайпа)
+                        print("[*] Сканирование букв для получения координат...")
+                        letters = detect_letters_on_screen(d, reader, expected_letters=ai_letters, screen_bgr=screen_bgr)
+
+                        if not letters:
+                            print("[AI Healing] Не удалось получить координаты букв. Ждём...")
+                            time.sleep(2.0)
+                            continue
+
+                        detected_chars = [item[0] for item in letters]
+                        print(f"[AI Healing] Координаты получены для {len(detected_chars)} букв: {sorted(detected_chars)}")
+
+                        # Переходим сразу к вводу слов (пропуская обычный OCR)
+                        # Сбрасываем stuck_counter чтобы дать AI шанс
+                        stuck_counter = max(0, stuck_counter - 2)
+
+                        # === Ввод слов (копия из основного цикла) ===
+                        level_cleared = False
+                        swiped_count = 0
+                        skipped_count = 0
+                        group_size = config.SWIPE_GROUP_SIZE if config.SWIPE_GROUP_SIZE else len(solutions)
+
+                        for g_start in range(0, len(solutions), group_size):
+                            group = solutions[g_start:g_start + group_size]
+                            for word in group:
+                                check_pause()
+                                path = get_word_swipe_path(word, letters)
+                                if not path:
+                                    skipped_count += 1
+                                    continue
+                                execution_path = list(path)
+                                if config.SWIPE_HOLD_LAST and len(execution_path) > 0:
+                                    execution_path.append(execution_path[-1])
+                                total_duration = max(0.05, (len(execution_path) - 1) * config.SWIPE_DURATION)
+                                print(f"  [AI] [{swiped_count + skipped_count + 1}/{len(solutions)}] Ввод слова: {word.upper()}")
+                                swiped_count += 1
+                                try:
+                                    with device_lock:
+                                        d.swipe_points(execution_path, total_duration)
+                                except Exception as e:
+                                    print(f"[!] Ошибка свайпа: {e}")
+                                time.sleep(config.SWIPE_DELAY)
+
+                            state, button_pos, button_name = check_game_state(d)
+                            if state == "tap_continue":
+                                print(f"[+] Промежуточная кнопка ({button_name}). Кликаем...")
+                                with device_lock:
+                                    d.click(button_pos[0], button_pos[1])
+                                time.sleep(1.5)
+                                state, button_pos, button_name = check_game_state(d)
+                            if state == "next_level":
+                                print(f"[+] Уровень завершен через AI! Кнопка ({button_name}). Кликаем {button_pos}...")
+                                with device_lock:
+                                    d.click(button_pos[0], button_pos[1])
+                                if current_level is not None:
+                                    current_level += 1
+                                    print(f"[+] Переход на следующий уровень: {current_level}")
+                                    _save_level_state(current_level)
+                                level_cleared = True
+                                stuck_counter = 0
+                                _wait_for_button_gone(d)
+                                break
+
+                        if not level_cleared:
+                            stuck_counter += 1
+                            print(f"[AI Healing] AI тоже не помог пройти уровень. (stuck={stuck_counter}, swiped={swiped_count}, skipped={skipped_count})")
+                            if stuck_counter >= config.STUCK_AI_HEALING_LIMIT + 3:
+                                print("[AI Healing] Все стратегии исчерпаны. Сброс и ожидание...")
+                                current_level = None
+                                mismatch_counter = 0
+                                stuck_counter = 0
+                                time.sleep(5.0)
+                        continue
+                    else:
+                        print("[AI Healing] AI не смог сгенерировать слова.")
+                else:
+                    print("[AI Healing] AI не смог распознать буквы.")
+
+                # AI не помог — сброс
+                if stuck_counter >= config.STUCK_AI_HEALING_LIMIT + 3:
+                    print("[!] Полный сброс после неудачных попыток AI.")
+                    current_level = None
+                    mismatch_counter = 0
+                    stuck_counter = 0
+                    time.sleep(5.0)
+                    continue
+                else:
+                    stuck_counter += 1
+                    time.sleep(2.0)
+                    continue
+
+            elif use_ai_healing and not ai_service.is_enabled:
+                # AI отключён — сбрасываем и пересканируем
+                print(f"[!] Бот застрял ({stuck_counter} попыток). AI Self-Healing недоступен (нет API ключа).")
+                print("[!] Сброс уровня и пересканирование...")
+                current_level = None
+                mismatch_counter = 0
+                stuck_counter = 0
+                time.sleep(2.0)
+                continue
+
             print("\n[*] Сканирование игрового поля (поиск букв)...")
             letters = detect_letters_on_screen(d, reader, expected_letters, screen_bgr=screen_bgr)
             
@@ -696,6 +974,13 @@ def main():
                 
             detected_chars = [item[0] for item in letters]
             print(f"[+] Найдено букв на экране: {len(detected_chars)} -> {sorted(detected_chars)}")
+
+            # Валидация OCR: слишком много уникальных букв = мусор (текст рекламы)
+            unique_chars = set(detected_chars)
+            if len(unique_chars) > config.MAX_UNIQUE_LETTERS:
+                print(f"[!] Слишком много уникальных букв ({len(unique_chars)} > {config.MAX_UNIQUE_LETTERS}). Вероятно, текст рекламы. Пропускаем...")
+                time.sleep(1.5)
+                continue
             
             # Проверяем, соответствуют ли распознанные буквы ответам уровня
             if expected_letters and solutions:
@@ -718,7 +1003,7 @@ def main():
                 continue
                 
             # Шаг C. Генерация/сопоставление решений
-            if stuck_counter >= config.STUCK_LOCAL_FALLBACK_LIMIT:
+            if stuck_counter >= config.STUCK_LOCAL_FALLBACK_LIMIT and stuck_counter < config.STUCK_AI_HEALING_LIMIT:
                 print(f"[!] Уровень не пройден за {stuck_counter} попыток подряд. Используем локальный словарь...")
                 solutions = utils.solve_anagrams(detected_chars, dictionary)
                 print(f"[+] Сгенерировано {len(solutions)} возможных слов из локального словаря.")
@@ -730,6 +1015,8 @@ def main():
                 if solutions:
                     current_level = matched_level
                     print(f"[+] Найдены точные ответы для Уровня {current_level} ({len(solutions)} слов): {solutions}")
+                    if current_level is not None:
+                        _save_level_state(current_level)
                 else:
                     print("[*] Не удалось получить ответы с сайта. Запуск локального поиска анаграмм...")
                     solutions = utils.solve_anagrams(detected_chars, dictionary)
@@ -800,6 +1087,7 @@ def main():
                     if current_level is not None:
                         current_level += 1
                         print(f"[+] Переход на следующий уровень: {current_level}")
+                        _save_level_state(current_level)
                     level_cleared = True
                     stuck_counter = 0
                     _wait_for_button_gone(d)
@@ -820,12 +1108,12 @@ def main():
                     continue
                 
                 # Если застряли STUCK_RESET_LIMIT+ раза подряд — принудительный сброс
-                if stuck_counter >= config.STUCK_RESET_LIMIT:
+                if stuck_counter >= config.STUCK_RESET_LIMIT and stuck_counter < config.STUCK_AI_HEALING_LIMIT:
                     print(f"[!] Бот застрял ({stuck_counter} попыток подряд без прогресса).")
                     print(f"[!] Сбрасываем номер уровня и переходим на полное распознавание OCR.")
                     current_level = None
                     mismatch_counter = 0
-                    stuck_counter = 0
+                    # НЕ сбрасываем stuck_counter — он продолжит расти до STUCK_AI_HEALING_LIMIT
                 
                 time.sleep(config.ACTION_DELAY)
                 
@@ -835,72 +1123,13 @@ def main():
         # Останавливаем фоновый поток
         stop_event.set()
         watchdog_thread.join(timeout=2.0)
+        # Выключаем show_taps
+        if config.SHOW_TAPS:
+            _enable_show_taps(d, enable=False)
+        # Сохраняем уровень
+        if current_level is not None:
+            _save_level_state(current_level)
         print("[+] Автокликер успешно остановлен.")
-
-
-def _detect_letters_contours_only(d, expected_letters, screen_bgr=None) -> list:
-    """
-    Быстрый режим: находит контуры и назначает буквы из expected_letters
-    без вызова OCR. Работает, когда количество контуров совпадает с ожиданием.
-    Буквы назначаются по углу позиции относительно центра (по часовой стрелке).
-    """
-    if screen_bgr is None:
-        screen_bgr = take_screenshot(d)
-    
-    x_roi, y_roi, w_roi, h_roi = config.CIRCLE_ROI["x"], config.CIRCLE_ROI["y"], config.CIRCLE_ROI["w"], config.CIRCLE_ROI["h"]
-    roi = screen_bgr[y_roi:y_roi+h_roi, x_roi:x_roi+w_roi]
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    
-    contours_data = _find_contours_with_threshold(gray, config.BINARY_THRESHOLD)
-    
-    # Если количество контуров не совпадает с ожидаемым — не можем назначить уверенно
-    if len(contours_data) != len(expected_letters):
-        return []
-    
-    # Сортируем контуры по углу (от верхнего, по часовой стрелке)
-    cx_roi_center, cy_roi_center = w_roi // 2, h_roi // 2
-    
-    def angle_key(cd):
-        dx = cd['center_local'][0] - cx_roi_center
-        dy = cd['center_local'][1] - cy_roi_center
-        import math
-        angle = math.atan2(dy, dx)
-        return angle
-    
-    contours_sorted = sorted(contours_data, key=angle_key)
-    expected_sorted = sorted(expected_letters)
-    
-    # Назначаем буквы по соотношению сторон:
-    # Определяем 'I' по aspect ratio, остальные назначаем в порядке оставшихся
-    assigned = {}
-    remaining_expected = list(expected_sorted)
-    
-    # Сначала назначаем буквы, которые можно определить по shape
-    for idx, cd in enumerate(contours_sorted):
-        shape_guess = _guess_letter_by_shape(cd['bbox'])
-        if shape_guess and shape_guess in remaining_expected:
-            assigned[idx] = shape_guess
-            remaining_expected.remove(shape_guess)
-    
-    # Оставшиеся буквы назначаем оставшимся контурам
-    unassigned = [idx for idx in range(len(contours_sorted)) if idx not in assigned]
-    
-    if len(unassigned) != len(remaining_expected):
-        return []  # Что-то пошло не так
-    
-    # Сортируем оставшиеся по aspect ratio и назначаем в алфавитном порядке
-    for idx, char in zip(unassigned, remaining_expected):
-        assigned[idx] = char.lower()
-    
-    # Собираем результат
-    letter_positions = []
-    for idx, cd in enumerate(contours_sorted):
-        char = assigned.get(idx)
-        if char:
-            abs_center = (x_roi + cd['center_local'][0], y_roi + cd['center_local'][1])
-            letter_positions.append((char, abs_center))
-    
-    return letter_positions
 
 
 if __name__ == "__main__":
