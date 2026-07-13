@@ -245,9 +245,12 @@ def watchdog_worker(d, stop_event):
             screen_bgr = take_screenshot(d)
             screen_h = screen_bgr.shape[0]
 
-            # Ограничиваем область поиска верхней частью экрана
-            ad_search_y_end = int(screen_h * config.AD_SEARCH_REGION_RATIO)
-            search_region = (0, ad_search_y_end)
+            # Ограничиваем область поиска, если коэффициент задан и меньше 1.0
+            if config.AD_SEARCH_REGION_RATIO and config.AD_SEARCH_REGION_RATIO < 1.0:
+                ad_search_y_end = int(screen_h * config.AD_SEARCH_REGION_RATIO)
+                search_region = (0, ad_search_y_end)
+            else:
+                search_region = None
             
             # Собираем шаблоны рекламных крестиков
             x_templates = []
