@@ -80,33 +80,41 @@ def call_ai_to_fix(traceback_str, filename, file_content):
 
 def run_bot():
     workspace_dir = os.path.dirname(os.path.abspath(__file__))
-    cmd = [sys.executable, "bot.py"]
+    # Запуск с флагом -u для отключения буферизации вывода
+    cmd = [sys.executable, "-u", "bot.py"]
     
     print("\n" + "="*60)
     print(f"[Self-Healing Runner] Запуск бота: {' '.join(cmd)}")
     print("="*60 + "\n")
     
+    # Копируем переменные окружения и принудительно задаем UTF-8 и отключение буферизации
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
+    
     try:
-        # Запускаем bot.py, объединяя stdout и stderr
+        # Запускаем bot.py, наследуя stdin родительского процесса для интерактивного ввода
         process = subprocess.Popen(
             cmd,
+            stdin=None,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
-            cwd=workspace_dir
+            cwd=workspace_dir,
+            env=env
         )
         
         output_buffer = []
-        # Читаем вывод построчно в реальном времени
+        # Читаем вывод посимвольно в реальном времени, чтобы видеть приглашения ко вводу без перевода строки
         while True:
-            line = process.stdout.readline()
-            if not line:
+            char = process.stdout.read(1)
+            if not char:
                 break
-            sys.stdout.write(line)
+            sys.stdout.write(char)
             sys.stdout.flush()
-            output_buffer.append(line)
+            output_buffer.append(char)
             
         process.wait()
         return process.returncode, "".join(output_buffer)

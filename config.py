@@ -9,6 +9,7 @@ import os
 # Загрузка переменных окружения из .env файла
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass  # python-dotenv не установлен — переменные окружения читаются напрямую
@@ -96,12 +97,14 @@ AD_SEARCH_REGION_RATIO = 1.0
 AD_COOLDOWN_SECONDS = 3.0
 
 # Максимальное число кликов по одному шаблону за период (защита от ложных срабатываний)
-AD_TEMPLATE_CLICK_LIMIT = 3        # Максимум кликов
-AD_TEMPLATE_CLICK_WINDOW = 20.0    # За сколько секунд
+AD_TEMPLATE_CLICK_LIMIT = 3  # Максимум кликов
+AD_TEMPLATE_CLICK_WINDOW = 20.0  # За сколько секунд
 
 # --- Настройки таймингов, скорости и логики ввода (Настраивайте под себя) ---
 WATCHDOG_INTERVAL = 1.0  # Интервал проверки рекламы фоновым потоком (секунды)
-SWIPE_DURATION = 0.015  # Длительность свайпа между двумя буквами (секунды одного перехода)
+SWIPE_DURATION = (
+    0.015  # Длительность свайпа между двумя буквами (секунды одного перехода)
+)
 SWIPE_HOLD_LAST = True  # Удерживать ли последнюю букву перед отпусканием (позволяет избежать обрезки ввода)
 SWIPE_DELAY = 0.25  # Пауза после ввода каждого слова (секунды)
 ACTION_DELAY = 0.05  # Пауза перед проверкой переходов на новый уровень (секунды)
@@ -117,19 +120,21 @@ SWIPE_GROUP_SIZE = 5
 # "hsv" - поиск в цветовом пространстве HSV (может быть стабильнее при изменении яркости)
 # "sobel" - поиск по контурам (фильтр Собеля; идеален для кнопок на градиентном фоне)
 NAV_BUTTONS_MATCH_METHOD = "bgr"  # Для кнопок навигации (Next, Continue)
-AD_CLOSE_MATCH_METHOD = "sobel"    # Для рекламных крестиков (Close)
+AD_CLOSE_MATCH_METHOD = "sobel"  # Для рекламных крестиков (Close)
 
 # --- Настройки при застревании бота на уровне ---
-STUCK_LOCAL_FALLBACK_LIMIT = 2  # Через сколько попыток ввода веб-слов переходить на локальный словарь
-STUCK_RESET_LIMIT = 4           # Через сколько попыток сбрасывать уровень и пересканировать OCR
-STUCK_AI_HEALING_LIMIT = 6      # Через сколько попыток вызывать AI Self-Healing (после исчерпания всех стратегий)
+STUCK_LOCAL_FALLBACK_LIMIT = (
+    2  # Через сколько попыток ввода веб-слов переходить на локальный словарь
+)
+STUCK_RESET_LIMIT = 4  # Через сколько попыток сбрасывать уровень и пересканировать OCR
+STUCK_AI_HEALING_LIMIT = 6  # Через сколько попыток вызывать AI Self-Healing (после исчерпания всех стратегий)
 
 # --- AI Self-Healing (OpenRouter) ---
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-AI_HEALING_ENABLED = True       # Включить AI Self-Healing (требуется API ключ)
+AI_HEALING_ENABLED = True  # Включить AI Self-Healing (требуется API ключ)
 AI_HEALING_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
-AI_HEALING_TIMEOUT = 15         # Таймаут HTTP запроса к OpenRouter (секунды)
-AI_HEALING_COOLDOWN = 10        # Минимальный интервал между вызовами AI (секунды)
+AI_HEALING_TIMEOUT = 15  # Таймаут HTTP запроса к OpenRouter (секунды)
+AI_HEALING_COOLDOWN = 10  # Минимальный интервал между вызовами AI (секунды)
 
 # --- Настройки обнаружения бонусного окна по цвету ---
 BONUS_DETECT_ENABLED = True
@@ -138,8 +143,7 @@ BONUS_DETECT_ENABLED = True
 BONUS_DETECT_ROI_RATIO = [0.2, 0.4, 0.8, 0.75]
 # Целевые цвета в формате BGR (OpenCV использует BGR вместо RGB!)
 BONUS_TARGET_COLORS = [
-    {"bgr": [0, 165, 255], "tolerance": 30},   # Оранжевый / Золотой
-    {"bgr": [76, 217, 100], "tolerance": 30},  # Ярко-зеленый (кнопка сбора/продолжения)
+    {"bgr": [68, 92, 180], "tolerance": 30},  # синий
 ]
 # Минимальное число пикселей целевого цвета, чтобы считать окно открытым
 BONUS_PIXEL_COUNT_THRESHOLD = 500
