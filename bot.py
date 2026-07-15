@@ -241,25 +241,51 @@ def watchdog_worker(d, stop_event):
                     time.sleep(1.0)
                     continue
 
-            # 2. Сканируем экран на наличие рекламных крестиков (дорогая операция — делаем после проверки пакета)
+            # 2. Сканируем экран на наличие кнопок (навигационных и крестиков рекламы)
             screen_bgr = take_screenshot(d)
             screen_h = screen_bgr.shape[0]
 
-            # Ограничиваем область поиска, если коэффициент задан и меньше 1.0
+            # Ограничиваем область поиска крестиков рекламы (если настроено)
             if config.AD_SEARCH_REGION_RATIO and config.AD_SEARCH_REGION_RATIO < 1.0:
                 ad_search_y_end = int(screen_h * config.AD_SEARCH_REGION_RATIO)
                 search_region = (0, ad_search_y_end)
             else:
                 search_region = None
             
-            # Собираем шаблоны рекламных крестиков
+            # Собираем шаблоны
+            nav_templates = []
             x_templates = []
             if os.path.exists(config.TEMPLATES_DIR):
                 for f in os.listdir(config.TEMPLATES_DIR):
                     name_lower = f.lower()
-                    if name_lower.startswith(("close", "x", "ad_close")):
-                        x_templates.append(os.path.join(config.TEMPLATES_DIR, f))
+                    full_path = os.path.join(config.TEMPLATES_DIR, f)
+                    if "next" in name_lower or "ok" in name_lower or "continue" in name_lower:
+                        nav_templates.append(full_path)
+                    elif name_lower.startswith(("close", "x", "ad_close")):
+                        x_templates.append(full_path)
             
+            clicked = False
+            
+            # 2.1. Сначала проверяем навигационные кнопки (Next, Continue) — приоритет!
+            for t_path in nav_templates:
+                t_name = os.path.basename(t_path)
+                pos, score = find_template_on_screen(
+                    screen_bgr, t_path,
+                    method=config.NAV_BUTTONS_MATCH_METHOD
+                )
+                if pos:
+                    print(f"[Watchdog] Обнаружена навигационная кнопка ({t_name}) с уверенностью {score:.2f}. Кликаем {pos}...")
+                    with device_lock:
+                        d.click(pos[0], pos[1])
+                    _set_ad_cooldown()
+                    time.sleep(1.0)
+                    clicked = True
+                    break
+            
+            if clicked:
+                continue
+            
+            # 2.2. Затем проверяем рекламные крестики
             for t_path in x_templates:
                 t_name = os.path.basename(t_path)
 
@@ -605,67 +631,6 @@ def get_word_swipe_path(word: str, letter_positions: list) -> list:
             
     return path
 
-def check_and_click_bonus_popup(d, screen_bgr):
-    """
-    Проверяет, нет ли на экране бонусного окна (сбора монет), по характерным цветам пикселей.
-    Использует контурный анализ для верификации размера и пропорций, чтобы отличить
-    большую горизонтальную кнопку сбора от мелких игровых элементов (букв, клеток) того же цвета.
-    Возвращает True, если бонусное окно было обнаружено и кликнуто, иначе False.
-    """
-    if not config.BONUS_DETECT_ENABLED:
-        return False
-
-    h, w = screen_bgr.shape[:2]
-    roi = config.BONUS_DETECT_ROI_RATIO
-    x_min, y_min = int(roi[0] * w), int(roi[1] * h)
-    x_max, y_max = int(roi[2] * w), int(roi[3] * h)
-    
-    crop = screen_bgr[y_min:y_max, x_min:x_max]
-    
-    for target in config.BONUS_TARGET_COLORS:
-        target_bgr = np.array(target["bgr"], dtype=np.uint8)
-        tolerance = target["tolerance"]
-        
-        # Границы для inRange
-        lower_bound = np.clip(target_bgr.astype(int) - tolerance, 0, 255).astype(np.uint8)
-        upper_bound = np.clip(target_bgr.astype(int) + tolerance, 0, 255).astype(np.uint8)
-        
-        mask = cv2.inRange(crop, lower_bound, upper_bound)
-        
-        # Находим внешние контуры подходящего цвета
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for c in contours:
-            area = cv2.contourArea(c)
-            # Отсекаем слишком маленькие контуры (шум, буквы, границы)
-            if area < config.BONUS_BUTTON_MIN_AREA:
-                continue
-                
-            x, y, btn_w, btn_h = cv2.boundingRect(c)
-            
-            # Проверяем геометрические размеры кнопки
-            if btn_w < config.BONUS_BUTTON_MIN_W or btn_h < config.BONUS_BUTTON_MIN_H:
-                continue
-                
-            # Проверяем соотношение сторон (кнопка должна быть горизонтально вытянутой)
-            aspect_ratio = btn_w / float(btn_h)
-            if not (config.BONUS_BUTTON_ASPECT_RATIO_MIN <= aspect_ratio <= config.BONUS_BUTTON_ASPECT_RATIO_MAX):
-                continue
-                
-            # Если все проверки пройдены, значит перед нами действительно кнопка сбора
-            avg_x = x_min + x + btn_w // 2
-            avg_y = y_min + y + btn_h // 2
-            
-            print(f"[Bonus Detector] Обнаружена кнопка сбора на бонусном окне!")
-            print(f"[Bonus Detector] Контур: x={x_min+x}, y={y_min+y}, w={btn_w}, h={btn_h}, area={int(area)} px.")
-            print(f"[Bonus Detector] Кликаем в центр кнопки: ({avg_x}, {avg_y})")
-            
-            with device_lock:
-                d.click(avg_x, avg_y)
-            return True
-            
-    return False
-
 def swipe_word_group(d, group, letters, solutions_len, swiped_start, skipped_start):
     """
     Вводит группу слов свайпами.
@@ -703,11 +668,11 @@ def swipe_word_group(d, group, letters, solutions_len, swiped_start, skipped_sta
         
         time.sleep(config.SWIPE_DELAY)
         
-        # Проверяем, не появилось ли бонусное окно
+        # Проверяем, не сменилось ли состояние экрана (появилась ли кнопка перехода/продолжения)
         screen_after = take_screenshot(d)
-        if check_and_click_bonus_popup(d, screen_after):
-            print("[Bonus Detector] Обнаружено и закрыто бонусное окно. Прерываем ввод группы.")
-            time.sleep(1.5)  # Ожидаем завершения анимации закрытия
+        state, button_pos, button_name = check_game_state(d, screen_after)
+        if state in ("tap_continue", "next_level"):
+            print(f"[Swipe Loop] Обнаружено всплывающее окно ({state}: {button_name}). Прерываем ввод группы.")
             return swiped_count, skipped_count, True, i
             
         i += 1
