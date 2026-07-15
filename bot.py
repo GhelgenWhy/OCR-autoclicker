@@ -634,22 +634,17 @@ def get_word_swipe_path(word: str, letter_positions: list) -> list:
 def swipe_word_group(d, group, letters, solutions_len, swiped_start, skipped_start):
     """
     Вводит группу слов свайпами.
-    Возвращает кортеж: (new_swiped_count, new_skipped_count, popup_detected, last_processed_index)
-    Если по ходу ввода обнаружено бонусное окно, прекращает ввод, закрывает его и возвращает popup_detected = True.
+    Возвращает кортеж: (new_swiped_count, new_skipped_count)
     """
     swiped_count = swiped_start
     skipped_count = skipped_start
     
-    words_to_swipe = list(group)
-    i = 0
-    while i < len(words_to_swipe):
-        word = words_to_swipe[i]
+    for word in group:
         check_pause()
         
         path = get_word_swipe_path(word, letters)
         if not path:
             skipped_count += 1
-            i += 1
             continue
             
         execution_path = list(path)
@@ -668,16 +663,7 @@ def swipe_word_group(d, group, letters, solutions_len, swiped_start, skipped_sta
         
         time.sleep(config.SWIPE_DELAY)
         
-        # Проверяем, не сменилось ли состояние экрана (появилась ли кнопка перехода/продолжения)
-        screen_after = take_screenshot(d)
-        state, button_pos, button_name = check_game_state(d, screen_after)
-        if state in ("tap_continue", "next_level"):
-            print(f"[Swipe Loop] Обнаружено всплывающее окно ({state}: {button_name}). Прерываем ввод группы.")
-            return swiped_count, skipped_count, True, i
-            
-        i += 1
-        
-    return swiped_count, skipped_count, False, len(words_to_swipe)
+    return swiped_count, skipped_count
 
 def check_game_state(d, screen_bgr=None):
     """
@@ -958,17 +944,9 @@ def main():
                         for g_start in range(0, len(solutions), group_size):
                             group = solutions[g_start:g_start + group_size]
                             
-                            g_idx = 0
-                            while g_idx < len(group):
-                                sub_group = group[g_idx:]
-                                swiped_count, skipped_count, popup_detected, last_idx = swipe_word_group(
-                                    d, sub_group, letters, len(solutions), swiped_count, skipped_count
-                                )
-                                if popup_detected:
-                                    g_idx += last_idx
-                                    continue
-                                else:
-                                    break
+                            swiped_count, skipped_count = swipe_word_group(
+                                d, group, letters, len(solutions), swiped_count, skipped_count
+                            )
 
                             state, button_pos, button_name = check_game_state(d)
                             if state == "tap_continue":
@@ -1086,17 +1064,9 @@ def main():
             for g_start in range(0, len(solutions), group_size):
                 group = solutions[g_start:g_start + group_size]
                 
-                g_idx = 0
-                while g_idx < len(group):
-                    sub_group = group[g_idx:]
-                    swiped_count, skipped_count, popup_detected, last_idx = swipe_word_group(
-                        d, sub_group, letters, len(solutions), swiped_count, skipped_count
-                    )
-                    if popup_detected:
-                        g_idx += last_idx
-                        continue
-                    else:
-                        break
+                swiped_count, skipped_count = swipe_word_group(
+                    d, group, letters, len(solutions), swiped_count, skipped_count
+                )
                 
                 # После ввода группы проверяем, не завершился ли уровень
                 state, button_pos, button_name = check_game_state(d)
