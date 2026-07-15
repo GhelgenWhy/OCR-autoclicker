@@ -302,3 +302,49 @@ class AIHealingService:
             print(f"[AI Healing] Не удалось извлечь слова из ответа AI: '{response[:100]}'")
 
         return words
+
+    def find_ad_close_coordinate(self, screenshot_bgr: np.ndarray) -> Optional[Tuple[int, int]]:
+        """
+        Отправляет скриншот в vision-модель, чтобы найти координаты крестика закрытия рекламы (x, y).
+        """
+        if not self._enabled:
+            return None
+
+        import re
+        h, w = screenshot_bgr.shape[:2]
+        image_b64 = self._encode_image(screenshot_bgr, quality=60)
+
+        prompt = (
+            f"You are looking at a mobile screen. There is an advertisement or popup active. "
+            f"Your task is to find the close button (usually an 'X', 'Close', 'Skip', or a tiny cross icon, "
+            f"often located in the corners: top-right, top-left, bottom-right, or bottom-left).\n\n"
+            f"Image dimensions: width={w}, height={h}.\n\n"
+            f"TASK: Estimate the center coordinates (x, y) of the close button in pixels.\n"
+            f"FORMAT: Return ONLY the coordinates as two numbers separated by a comma (e.g. 1010, 85). "
+            f"If there is no close button visible, return 'none'. Do not include any other text."
+        )
+
+        print("[AI Healing] Поиск крестика рекламы через AI vision...")
+        response = self._call_api(prompt, image_b64, max_tokens=50)
+
+        if not response:
+            return None
+
+        clean = response.strip().lower()
+        if "none" in clean:
+            print("[AI Healing] AI не обнаружил крестик закрытия.")
+            return None
+
+        # Парсим "x, y"
+        try:
+            nums = re.findall(r'\d+', clean)
+            if len(nums) >= 2:
+                x, y = int(nums[0]), int(nums[1])
+                if 0 <= x <= w and 0 <= y <= h:
+                    print(f"[AI Healing] AI нашёл крестик по координатам: {x}, {y}")
+                    return (x, y)
+        except Exception as e:
+            print(f"[AI Healing] Ошибка парсинга координат крестика: {e}")
+
+        return None
+

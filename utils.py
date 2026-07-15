@@ -16,8 +16,8 @@ import config
 _level_cache: Dict[int, List[str]] = {}
 _search_cache: Dict[str, Tuple[List[str], int]] = {}
 
-# Ссылка для скачивания Scrabble словаря английских слов (~83 000 слов)
-DICTIONARY_URL = "https://raw.githubusercontent.com/raun/Scrabble/master/words.txt"
+# Ссылка для скачивания Scrabble словаря английских слов (~267 000 слов, включая "afro")
+DICTIONARY_URL = "https://raw.githubusercontent.com/jesstess/Scrabble/master/scrabble/sowpods.txt"
 
 # Базовый встроенный словарь на случай отсутствия интернета
 FALLBACK_WORDS = [
@@ -169,8 +169,8 @@ def load_dictionary() -> Set[str]:
                     w = line.strip().lower()
                     if w.isalpha() and len(w) >= 3:
                         words.add(w)
-            if len(words) < 20000:
-                print(f"[*] Локальный словарь слишком мал ({len(words)} слов). Будет скачан расширенный словарь.")
+            if len(words) < 150000 or "afro" not in words:
+                print(f"[*] Локальный словарь устарел или слишком мал ({len(words)} слов). Будет скачан расширенный словарь SOWPODS.")
                 should_download = True
                 words.clear()
             else:

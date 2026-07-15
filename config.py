@@ -131,5 +131,18 @@ AI_HEALING_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
 AI_HEALING_TIMEOUT = 15         # Таймаут HTTP запроса к OpenRouter (секунды)
 AI_HEALING_COOLDOWN = 10        # Минимальный интервал между вызовами AI (секунды)
 
+# --- Настройки обнаружения бонусного окна по цвету ---
+BONUS_DETECT_ENABLED = True
+# Область экрана для поиска цвета [x_min_ratio, y_min_ratio, x_max_ratio, y_max_ratio]
+# Задает прямоугольник в центральной части экрана (по высоте от 40% до 75% и по ширине от 20% до 80%)
+BONUS_DETECT_ROI_RATIO = [0.2, 0.4, 0.8, 0.75]
+# Целевые цвета в формате BGR (OpenCV использует BGR вместо RGB!)
+BONUS_TARGET_COLORS = [
+    {"bgr": [0, 165, 255], "tolerance": 30},   # Оранжевый / Золотой
+    {"bgr": [76, 217, 100], "tolerance": 30},  # Ярко-зеленый (кнопка сбора/продолжения)
+]
+# Минимальное число пикселей целевого цвета, чтобы считать окно открытым
+BONUS_PIXEL_COUNT_THRESHOLD = 500
+
 # --- Отладка ---
 SHOW_TAPS = True  # Включить отображение нажатий на экране устройства (Developer Options → Show taps)

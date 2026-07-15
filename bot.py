@@ -605,6 +605,96 @@ def get_word_swipe_path(word: str, letter_positions: list) -> list:
             
     return path
 
+def check_and_click_bonus_popup(d, screen_bgr):
+    """
+    Проверяет, нет ли на экране бонусного окна (сбора монет), по характерным цветам пикселей.
+    Если обнаружено, автоматически кликает в центр совпавших пикселей для быстрого закрытия.
+    Возвращает True, если бонусное окно было обнаружено и кликнуто, иначе False.
+    """
+    if not config.BONUS_DETECT_ENABLED:
+        return False
+
+    h, w = screen_bgr.shape[:2]
+    roi = config.BONUS_DETECT_ROI_RATIO
+    x_min, y_min = int(roi[0] * w), int(roi[1] * h)
+    x_max, y_max = int(roi[2] * w), int(roi[3] * h)
+    
+    crop = screen_bgr[y_min:y_max, x_min:x_max]
+    
+    for target in config.BONUS_TARGET_COLORS:
+        target_bgr = np.array(target["bgr"], dtype=np.uint8)
+        tolerance = target["tolerance"]
+        
+        # Границы для inRange
+        lower_bound = np.clip(target_bgr.astype(int) - tolerance, 0, 255).astype(np.uint8)
+        upper_bound = np.clip(target_bgr.astype(int) + tolerance, 0, 255).astype(np.uint8)
+        
+        mask = cv2.inRange(crop, lower_bound, upper_bound)
+        pixel_count = np.sum(mask > 0)
+        
+        if pixel_count >= config.BONUS_PIXEL_COUNT_THRESHOLD:
+            # Находим координаты всех совпавших пикселей
+            y_indices, x_indices = np.where(mask > 0)
+            avg_x = int(np.mean(x_indices)) + x_min
+            avg_y = int(np.mean(y_indices)) + y_min
+            
+            print(f"[Bonus Detector] Обнаружено бонусное окно! Пикселей цвета {target['bgr']} = {pixel_count} >= {config.BONUS_PIXEL_COUNT_THRESHOLD}.")
+            print(f"[Bonus Detector] Кликаем в центр кнопки сбора: ({avg_x}, {avg_y})")
+            
+            with device_lock:
+                d.click(avg_x, avg_y)
+            return True
+            
+    return False
+
+def swipe_word_group(d, group, letters, solutions_len, swiped_start, skipped_start):
+    """
+    Вводит группу слов свайпами.
+    Возвращает кортеж: (new_swiped_count, new_skipped_count, popup_detected, last_processed_index)
+    Если по ходу ввода обнаружено бонусное окно, прекращает ввод, закрывает его и возвращает popup_detected = True.
+    """
+    swiped_count = swiped_start
+    skipped_count = skipped_start
+    
+    words_to_swipe = list(group)
+    i = 0
+    while i < len(words_to_swipe):
+        word = words_to_swipe[i]
+        check_pause()
+        
+        path = get_word_swipe_path(word, letters)
+        if not path:
+            skipped_count += 1
+            i += 1
+            continue
+            
+        execution_path = list(path)
+        if config.SWIPE_HOLD_LAST and len(execution_path) > 0:
+            execution_path.append(execution_path[-1])
+        
+        total_duration = max(0.05, (len(execution_path) - 1) * config.SWIPE_DURATION)
+        print(f"[{swiped_count + skipped_count + 1}/{solutions_len}] Ввод слова: {word.upper()} ({len(word)} букв)")
+        
+        try:
+            with device_lock:
+                d.swipe_points(execution_path, total_duration)
+            swiped_count += 1
+        except Exception as e:
+            print(f"[!] Ошибка при выполнении свайпа: {e}")
+        
+        time.sleep(config.SWIPE_DELAY)
+        
+        # Проверяем, не появилось ли бонусное окно
+        screen_after = take_screenshot(d)
+        if check_and_click_bonus_popup(d, screen_after):
+            print("[Bonus Detector] Обнаружено и закрыто бонусное окно. Прерываем ввод группы.")
+            time.sleep(1.5)  # Ожидаем завершения анимации закрытия
+            return swiped_count, skipped_count, True, i
+            
+        i += 1
+        
+    return swiped_count, skipped_count, False, len(words_to_swipe)
+
 def check_game_state(d, screen_bgr=None):
     """
     Делает скриншот (или использует готовый) и проверяет текущую ситуацию на экране.
@@ -836,27 +926,22 @@ def main():
             use_ai_healing = False
 
             if stuck_counter >= config.STUCK_AI_HEALING_LIMIT:
-                # Все стратегии исчерпаны — вызываем AI
                 use_ai_healing = True
-            elif current_level is not None and stuck_counter < config.STUCK_LOCAL_FALLBACK_LIMIT:
-                if mismatch_counter < 2:
-                    print(f"[*] Скачивание ответов для Уровня {current_level} с сайта wordcityanswers.com...")
-                    solutions = utils.get_words_for_level(current_level)
-                    if solutions:
-                        expected_letters = utils.get_wheel_letters_from_words(solutions)
-                        print(f"[+] Ожидаемые буквы уровня: {sorted(expected_letters)}")
-                    else:
-                        print("[*] Не удалось получить ответы с сайта по номеру уровня.")
-                else:
-                    print(f"[!] Превышено количество несовпадений ({mismatch_counter}/2). Сбрасываем номер уровня для перехода на поиск по буквам.")
-                    current_level = None
-                    mismatch_counter = 0
             
-            # AI Self-Healing: альтернативное распознавание букв
+            # AI Self-Healing: сначала попробуем закрыть рекламу по крестику
             if use_ai_healing and ai_service.is_enabled:
-                print(f"\n[AI Healing] === Активация AI Self-Healing (stuck={stuck_counter}) ===")
+                print(f"\n[AI Healing] === Проверка наличия рекламы на экране (stuck={stuck_counter}) ===")
+                ad_close_pos = ai_service.find_ad_close_coordinate(screen_bgr)
+                if ad_close_pos:
+                    print(f"[AI Healing] Кликаем по найденным AI координатам крестика: {ad_close_pos}")
+                    with device_lock:
+                        d.click(ad_close_pos[0], ad_close_pos[1])
+                    time.sleep(3.0)
+                    stuck_counter = max(0, stuck_counter - 1)
+                    continue
 
-                # Шаг 1: AI распознаёт буквы
+                # Если крестик не найден, пробуем обычное AI Self-Healing (распознавание букв и составление слов)
+                print(f"[AI Healing] Крестик рекламы не обнаружен. Пробуем распознавание букв через AI...")
                 ai_letters = ai_service.recognize_letters(screen_bgr)
                 if ai_letters:
                     print(f"[AI Healing] AI распознал буквы: {ai_letters}")
@@ -866,7 +951,6 @@ def main():
                     if ai_words:
                         solutions = ai_words
                         # Пересканируем буквы с OCR для получения координат
-                        # (AI дал буквы, но нам нужны позиции для свайпа)
                         print("[*] Сканирование букв для получения координат...")
                         letters = detect_letters_on_screen(d, reader, expected_letters=ai_letters, screen_bgr=screen_bgr)
 
@@ -878,11 +962,10 @@ def main():
                         detected_chars = [item[0] for item in letters]
                         print(f"[AI Healing] Координаты получены для {len(detected_chars)} букв: {sorted(detected_chars)}")
 
-                        # Переходим сразу к вводу слов (пропуская обычный OCR)
                         # Сбрасываем stuck_counter чтобы дать AI шанс
                         stuck_counter = max(0, stuck_counter - 2)
 
-                        # === Ввод слов (копия из основного цикла) ===
+                        # === Ввод слов ===
                         level_cleared = False
                         swiped_count = 0
                         skipped_count = 0
@@ -890,24 +973,18 @@ def main():
 
                         for g_start in range(0, len(solutions), group_size):
                             group = solutions[g_start:g_start + group_size]
-                            for word in group:
-                                check_pause()
-                                path = get_word_swipe_path(word, letters)
-                                if not path:
-                                    skipped_count += 1
+                            
+                            g_idx = 0
+                            while g_idx < len(group):
+                                sub_group = group[g_idx:]
+                                swiped_count, skipped_count, popup_detected, last_idx = swipe_word_group(
+                                    d, sub_group, letters, len(solutions), swiped_count, skipped_count
+                                )
+                                if popup_detected:
+                                    g_idx += last_idx
                                     continue
-                                execution_path = list(path)
-                                if config.SWIPE_HOLD_LAST and len(execution_path) > 0:
-                                    execution_path.append(execution_path[-1])
-                                total_duration = max(0.05, (len(execution_path) - 1) * config.SWIPE_DURATION)
-                                print(f"  [AI] [{swiped_count + skipped_count + 1}/{len(solutions)}] Ввод слова: {word.upper()}")
-                                swiped_count += 1
-                                try:
-                                    with device_lock:
-                                        d.swipe_points(execution_path, total_duration)
-                                except Exception as e:
-                                    print(f"[!] Ошибка свайпа: {e}")
-                                time.sleep(config.SWIPE_DELAY)
+                                else:
+                                    break
 
                             state, button_pos, button_name = check_game_state(d)
                             if state == "tap_continue":
@@ -1005,27 +1082,10 @@ def main():
                 time.sleep(config.ACTION_DELAY)
                 continue
                 
-            # Шаг C. Генерация/сопоставление решений
-            if stuck_counter >= config.STUCK_LOCAL_FALLBACK_LIMIT and stuck_counter < config.STUCK_AI_HEALING_LIMIT:
-                print(f"[!] Уровень не пройден за {stuck_counter} попыток подряд. Используем локальный словарь...")
-                solutions = utils.solve_anagrams(detected_chars, dictionary)
-                print(f"[+] Сгенерировано {len(solutions)} возможных слов из локального словаря.")
-            elif not solutions:
-                # Если уровень не был известен или скачивание напрямую не удалось,
-                # ищем ответы по буквам на сайте
-                print("[*] Поиск решений по буквам на сайте wordcityanswers.com...")
-                solutions, matched_level = utils.solve_anagrams_web(detected_chars)
-                if solutions:
-                    current_level = matched_level
-                    print(f"[+] Найдены точные ответы для Уровня {current_level} ({len(solutions)} слов): {solutions}")
-                    if current_level is not None:
-                        _save_level_state(current_level)
-                else:
-                    print("[*] Не удалось получить ответы с сайта. Запуск локального поиска анаграмм...")
-                    solutions = utils.solve_anagrams(detected_chars, dictionary)
-                    print(f"[+] Сгенерировано {len(solutions)} возможных слов из локального словаря.")
-            else:
-                print(f"[+] Буквы успешно сопоставлены. Готовы ответы для Уровня {current_level} ({len(solutions)} слов): {solutions}")
+            # Шаг C. Генерация решений напрямую через локальный словарь
+            print("[*] Запуск поиска анаграмм в локальном словаре...")
+            solutions = utils.solve_anagrams(detected_chars, dictionary)
+            print(f"[+] Сгенерировано {len(solutions)} возможных слов из локального словаря.")
             
             if not solutions:
                 print("[!] Не удалось собрать слова из распознанных букв. Попробуем пересканировать через секунду...")
@@ -1037,40 +1097,22 @@ def main():
             swiped_count = 0
             skipped_count = 0
             
-            # Если SWIPE_GROUP_SIZE равен 0, None или False — вводим сразу все слова (без промежуточных проверок экрана)
             group_size = config.SWIPE_GROUP_SIZE if config.SWIPE_GROUP_SIZE else len(solutions)
             
             for g_start in range(0, len(solutions), group_size):
                 group = solutions[g_start:g_start + group_size]
                 
-                # Вводим группу слов без проверки экрана между ними
-                for word in group:
-                    # Проверяем, не нажал ли пользователь паузу
-                    check_pause()
-                    
-                    path = get_word_swipe_path(word, letters)
-                    if not path:
-                        skipped_count += 1
+                g_idx = 0
+                while g_idx < len(group):
+                    sub_group = group[g_idx:]
+                    swiped_count, skipped_count, popup_detected, last_idx = swipe_word_group(
+                        d, sub_group, letters, len(solutions), swiped_count, skipped_count
+                    )
+                    if popup_detected:
+                        g_idx += last_idx
                         continue
-                        
-                    # Дублируем последнюю координату для удержания (фиксации) на последней букве
-                    execution_path = list(path)
-                    if config.SWIPE_HOLD_LAST and len(execution_path) > 0:
-                        execution_path.append(execution_path[-1])
-                    
-                    # Длительность свайпа пропорциональна числу сегментов
-                    total_duration = max(0.05, (len(execution_path) - 1) * config.SWIPE_DURATION)
-                    
-                    print(f"[{swiped_count + skipped_count + 1}/{len(solutions)}] Ввод слова: {word.upper()} ({len(word)} букв)")
-                    swiped_count += 1
-                    
-                    try:
-                        with device_lock:
-                            d.swipe_points(execution_path, total_duration)
-                    except Exception as e:
-                        print(f"[!] Ошибка при выполнении свайпа: {e}")
-                        
-                    time.sleep(config.SWIPE_DELAY)
+                    else:
+                        break
                 
                 # После ввода группы проверяем, не завершился ли уровень
                 state, button_pos, button_name = check_game_state(d)
@@ -1080,7 +1122,6 @@ def main():
                     with device_lock:
                         d.click(button_pos[0], button_pos[1])
                     time.sleep(1.5)
-                    # Перепроверяем — может за continue было next_level
                     state, button_pos, button_name = check_game_state(d)
                 
                 if state == "next_level":
