@@ -143,10 +143,16 @@ BONUS_DETECT_ENABLED = True
 BONUS_DETECT_ROI_RATIO = [0.2, 0.4, 0.8, 0.75]
 # Целевые цвета в формате BGR (OpenCV использует BGR вместо RGB!)
 BONUS_TARGET_COLORS = [
-    {"bgr": [68, 92, 180], "tolerance": 30},  # синий
+    {"bgr": [180, 92, 68], "tolerance": 30},  # синий
 ]
-# Минимальное число пикселей целевого цвета, чтобы считать окно открытым
-BONUS_PIXEL_COUNT_THRESHOLD = 500
+# Минимальные размеры для контура кнопки (ширина и высота в пикселях на 1080p)
+BONUS_BUTTON_MIN_W = 150
+BONUS_BUTTON_MIN_H = 50
+# Соотношение сторон кнопки (ширина / высота)
+BONUS_BUTTON_ASPECT_RATIO_MIN = 1.5
+BONUS_BUTTON_ASPECT_RATIO_MAX = 5.0
+# Минимальная площадь сплошного контура кнопки в пикселях
+BONUS_BUTTON_MIN_AREA = 3000
 
 # --- Отладка ---
 SHOW_TAPS = True  # Включить отображение нажатий на экране устройства (Developer Options → Show taps)

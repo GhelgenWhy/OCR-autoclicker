@@ -608,7 +608,8 @@ def get_word_swipe_path(word: str, letter_positions: list) -> list:
 def check_and_click_bonus_popup(d, screen_bgr):
     """
     Проверяет, нет ли на экране бонусного окна (сбора монет), по характерным цветам пикселей.
-    Если обнаружено, автоматически кликает в центр совпавших пикселей для быстрого закрытия.
+    Использует контурный анализ для верификации размера и пропорций, чтобы отличить
+    большую горизонтальную кнопку сбора от мелких игровых элементов (букв, клеток) того же цвета.
     Возвращает True, если бонусное окно было обнаружено и кликнуто, иначе False.
     """
     if not config.BONUS_DETECT_ENABLED:
@@ -630,16 +631,34 @@ def check_and_click_bonus_popup(d, screen_bgr):
         upper_bound = np.clip(target_bgr.astype(int) + tolerance, 0, 255).astype(np.uint8)
         
         mask = cv2.inRange(crop, lower_bound, upper_bound)
-        pixel_count = np.sum(mask > 0)
         
-        if pixel_count >= config.BONUS_PIXEL_COUNT_THRESHOLD:
-            # Находим координаты всех совпавших пикселей
-            y_indices, x_indices = np.where(mask > 0)
-            avg_x = int(np.mean(x_indices)) + x_min
-            avg_y = int(np.mean(y_indices)) + y_min
+        # Находим внешние контуры подходящего цвета
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for c in contours:
+            area = cv2.contourArea(c)
+            # Отсекаем слишком маленькие контуры (шум, буквы, границы)
+            if area < config.BONUS_BUTTON_MIN_AREA:
+                continue
+                
+            x, y, btn_w, btn_h = cv2.boundingRect(c)
             
-            print(f"[Bonus Detector] Обнаружено бонусное окно! Пикселей цвета {target['bgr']} = {pixel_count} >= {config.BONUS_PIXEL_COUNT_THRESHOLD}.")
-            print(f"[Bonus Detector] Кликаем в центр кнопки сбора: ({avg_x}, {avg_y})")
+            # Проверяем геометрические размеры кнопки
+            if btn_w < config.BONUS_BUTTON_MIN_W or btn_h < config.BONUS_BUTTON_MIN_H:
+                continue
+                
+            # Проверяем соотношение сторон (кнопка должна быть горизонтально вытянутой)
+            aspect_ratio = btn_w / float(btn_h)
+            if not (config.BONUS_BUTTON_ASPECT_RATIO_MIN <= aspect_ratio <= config.BONUS_BUTTON_ASPECT_RATIO_MAX):
+                continue
+                
+            # Если все проверки пройдены, значит перед нами действительно кнопка сбора
+            avg_x = x_min + x + btn_w // 2
+            avg_y = y_min + y + btn_h // 2
+            
+            print(f"[Bonus Detector] Обнаружена кнопка сбора на бонусном окне!")
+            print(f"[Bonus Detector] Контур: x={x_min+x}, y={y_min+y}, w={btn_w}, h={btn_h}, area={int(area)} px.")
+            print(f"[Bonus Detector] Кликаем в центр кнопки: ({avg_x}, {avg_y})")
             
             with device_lock:
                 d.click(avg_x, avg_y)
